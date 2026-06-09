@@ -1,0 +1,11 @@
+services:
+  wingman:
+    build: .
+    env_file: .env
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+    volumes:
+      # Persist the SQLite database and uploaded resumes across restarts
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+    restart: unless-stopped

@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Environment — contains API keys, SMTP credentials, bot token
+.env
+
+# Runtime data — personal, generated, or machine-specific
+data/
+uploads/
+
+# TypeScript build output (project uses tsx, no compile step needed)
+dist/
+build/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Test screenshots attached during development
+*.png
+*.jpg
+*.jpeg
