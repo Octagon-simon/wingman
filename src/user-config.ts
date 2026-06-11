@@ -12,6 +12,9 @@ export interface UserConfig {
   defaultVariant?: string
   portfolioUrl?: string
   chatId?: number
+  // Certificate name → URL map, built from DOCX hyperlinks on /setup.
+  // Used to reliably attach links to certificates when the AI misses them.
+  certLinks?: Record<string, string>
   // Legacy field — migrated automatically on first read
   resumePath?: string
 }

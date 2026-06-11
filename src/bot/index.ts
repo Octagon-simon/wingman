@@ -14,11 +14,37 @@ import { optimizeResume } from '../ai/optimizer'
 import { generateCoverLetter } from '../ai/cover-letter'
 import { extractJobDetails } from '../ai/job-extractor'
 import { generateFollowUp } from '../ai/follow-up'
+import { analyzeGaps } from '../ai/gap-analyzer'
 import { generateResumeDocx } from '../resume/generator'
+import { extractLinks } from '../resume/parser'
+import { countDocxPages } from '../resume/page-check'
 import { sendApplication, sendFollowUp } from '../email/sender'
 import { db } from '../db'
 import { applications } from '../db/schema'
 import { eq, desc, isNotNull } from 'drizzle-orm'
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// Downloads a Telegram file URL with up to 3 attempts and exponential backoff.
+// Telegram's CDN occasionally times out; retrying almost always succeeds.
+async function downloadWithRetry(url: string, attempts = 3): Promise<Buffer> {
+  let lastErr: unknown
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await axios.get<ArrayBuffer>(url, {
+        responseType: 'arraybuffer',
+        timeout: 30_000,
+      })
+      return Buffer.from(res.data)
+    } catch (err) {
+      lastErr = err
+      if (i < attempts - 1) {
+        await new Promise(r => setTimeout(r, (i + 1) * 2000))
+      }
+    }
+  }
+  throw lastErr
+}
 
 // ─── Session ─────────────────────────────────────────────────────────────────
 
@@ -32,9 +58,12 @@ interface SessionData {
   company?: string
   toEmail?: string
   jd?: string
-  resumeText?: string       // cached so revisions don't re-parse the file
-  selectedVariant?: string  // label of chosen resume variant
+  resumeText?: string         // cached so revisions don't re-parse the file
+  selectedVariant?: string    // label of chosen resume variant
+  additionalContext?: string  // extra info provided after gap analysis
+  contextGathered?: boolean   // true once gap analysis step is complete
   pendingResumePath?: string
+  resumeManuallyUploaded?: boolean  // true when user uploaded a DOCX; prevents free-text from re-running optimizer
   pendingCoverLetter?: string
   providerUsed?: string
   // setup
@@ -81,12 +110,33 @@ function variantList(cfg: ReturnType<typeof getUserConfig>): string {
 
 async function processApplication(ctx: Ctx): Promise<void> {
   const cfg = getUserConfig()
-  const variantPath = getResumePath(cfg, ctx.session.selectedVariant)
-  if (!variantPath || !existsSync(variantPath)) {
-    throw new Error('Resume file not found. Run /setup to upload a new one.')
+
+  // Parse resume once; cache in session so revisions and context-retry skip this
+  if (!ctx.session.resumeText) {
+    const variantPath = getResumePath(cfg, ctx.session.selectedVariant)
+    if (!variantPath || !existsSync(variantPath)) {
+      throw new Error('Resume file not found. Run /setup to upload a new one.')
+    }
+    ctx.session.resumeText = await parseResume(variantPath)
   }
-  const resumeText = await parseResume(variantPath)
-  ctx.session.resumeText = resumeText
+
+  // Gap analysis — only on first run, before context has been gathered, and only when a JD exists
+  if (!ctx.session.contextGathered && ctx.session.jd?.trim()) {
+    const analysis = await analyzeGaps(ctx.session.resumeText, ctx.session.jd!, ctx.session.role!)
+
+    if (analysis.hasSignificantGaps && analysis.gaps.length > 0) {
+      ctx.session.step = 'awaiting_context'
+      const gapList = analysis.gaps.map(g => `• ${g}`).join('\n')
+      await ctx.reply(
+        `Your resume is a strong fit overall, but the JD specifically requires:\n\n${gapList}\n\nDo you have any experience with these? Share details and I'll work them into your application — or type *skip* to proceed as-is.`,
+        { parse_mode: 'Markdown' }
+      )
+      return
+    }
+
+    ctx.session.contextGathered = true
+  }
+
   await runAIAndSendPreview(ctx, cfg.portfolioUrl)
 }
 
@@ -132,10 +182,24 @@ async function runAIAndSendPreview(
   let keywords: string[] = []
 
   if (shouldReviseResume) {
-    const optimized = await optimizeResume(resumeText!, jd!, role!, portfolioUrl, revisionNote)
-    resumePath = await generateResumeDocx(optimized.resume, `${slug}-${ts}.docx`)
+    const certLinks = getUserConfig().certLinks
+    const optimized = await optimizeResume(resumeText!, jd!, role!, portfolioUrl, revisionNote, ctx.session.additionalContext)
+    resumePath = await generateResumeDocx(optimized.resume, `${slug}-${ts}.docx`, certLinks)
+    ctx.session.resumeManuallyUploaded = false  // AI owns the resume now
     providerResume = optimized.provider
-    keywords = optimized.keywordsAdded
+    keywords = optimized.keywordsAdded ?? []
+
+    // If the generated resume spills onto a second page, retry with shorter bullets
+    const pages = await countDocxPages(resumePath!, optimized.resume)
+    if (pages > 1) {
+      console.log('[resume] overflow detected — retrying with shorter bullets')
+      const shortenNote = (revisionNote ? revisionNote + '\n\n' : '') +
+        'CRITICAL: The resume is currently overflowing to a second page. Reduce every bullet point to at most 10 words. Keep only the single most impactful fact per bullet. Do not change anything else.'
+      const reopt = await optimizeResume(resumeText!, jd!, role!, portfolioUrl, shortenNote, ctx.session.additionalContext)
+      resumePath = await generateResumeDocx(reopt.resume, `${slug}-${ts}.docx`, certLinks)
+      providerResume = reopt.provider
+      keywords = reopt.keywordsAdded ?? []
+    }
   }
 
   if (shouldReviseCL) {
@@ -173,10 +237,12 @@ async function runAIAndSendPreview(
       { caption: '📝 Cover letter' }
     )
   }
-  if (shouldReviseResume) {
+  // Always send the resume so the user can verify what will be attached to the email,
+  // even when this pass only revised the cover letter.
+  if (resumePath && existsSync(resumePath)) {
     await ctx.replyWithDocument(
-      new InputFile(resumePath!, `${displayName}.docx`),
-      { caption: '📄 ATS-optimised resume' }
+      new InputFile(resumePath, `${displayName}.docx`),
+      { caption: shouldReviseResume ? '📄 Resume' : '📄 Resume (unchanged)' }
     )
   }
 
@@ -209,7 +275,10 @@ async function runAIAndSendPreview(
 // ─── Bot ─────────────────────────────────────────────────────────────────────
 
 export function createBot() {
-  const bot = new Bot<Ctx>(config.telegramToken)
+  // timeoutSeconds: grammY's per-request fetch timeout.
+  // Default is 500s — way too long when the network can't reach api.telegram.org.
+  // 35s: 5s buffer over the 30s long-poll timeout so getUpdates isn't aborted early.
+  const bot = new Bot<Ctx>(config.telegramToken, { client: { timeoutSeconds: 35 } })
 
   bot.use(session<SessionData, Ctx>({ initial: freshSession }))
 
@@ -219,6 +288,7 @@ export function createBot() {
 
 *Commands*
 /setup — upload a resume variant and set your portfolio URL
+/portfolio <url> — set or update your portfolio URL (use "clear" to remove it)
 /apply — start a new application (paste a URL or type the role)
 /status — view your last 10 applications
 /followup <id> — send a follow-up email for an application
@@ -240,6 +310,24 @@ Upload a TXT — replace the cover letter manually`
   bot.command('cancel', ctx => {
     clearFlow(ctx)
     return ctx.reply('Cancelled. Use /apply or /setup to start again.')
+  })
+
+  // ── /portfolio ───────────────────────────────────────────────────────────────
+
+  bot.command('portfolio', ctx => {
+    const arg = ctx.match?.trim()
+    if (!arg) {
+      const current = getUserConfig().portfolioUrl
+      return ctx.reply(current
+        ? `Current portfolio: ${current}\n\nSend /portfolio <url> to update it, or /portfolio clear to remove it.`
+        : 'No portfolio URL set.\n\nSend /portfolio <url> to add one.')
+    }
+    if (arg.toLowerCase() === 'clear') {
+      setUserConfig({ portfolioUrl: undefined })
+      return ctx.reply('Portfolio URL removed.')
+    }
+    setUserConfig({ portfolioUrl: arg })
+    return ctx.reply(`Portfolio URL updated: ${arg}`)
   })
 
   // ── /setup ──────────────────────────────────────────────────────────────────
@@ -462,7 +550,7 @@ Upload a TXT — replace the cover letter manually`
             return ctx.reply(`Which resume variant?\n${variantList(cfg)}`)
           }
           ctx.session.step = 'processing'
-          await ctx.reply('Processing your application... ⏳ (15–30s)')
+          await ctx.reply('Analysing fit... ⏳')
           try {
             await processApplication(ctx)
           } catch (err) {
@@ -496,7 +584,7 @@ Upload a TXT — replace the cover letter manually`
         if (ctx.session.jd) {
           // JD was pre-filled by scraper
           ctx.session.step = 'processing'
-          await ctx.reply('Processing your application... ⏳ (15–30s)')
+          await ctx.reply('Analysing fit... ⏳')
           try {
             await processApplication(ctx)
           } catch (err) {
@@ -520,7 +608,7 @@ Upload a TXT — replace the cover letter manually`
         ctx.session.selectedVariant = variants[n - 1]!.label
         if (ctx.session.jd) {
           ctx.session.step = 'processing'
-          await ctx.reply('Processing your application... ⏳ (15–30s)')
+          await ctx.reply('Analysing fit... ⏳')
           try {
             await processApplication(ctx)
           } catch (err) {
@@ -537,7 +625,10 @@ Upload a TXT — replace the cover letter manually`
       if (ctx.session.step === 'awaiting_jd') {
         let jd = text
 
-        if (text.startsWith('http')) {
+        const noJd = /^(none|no|n\/a|na|skip|-)$/i.test(text.trim())
+        if (noJd) {
+          jd = ''
+        } else if (text.startsWith('http')) {
           await ctx.reply('Fetching job posting...')
           try {
             const res = await axios.get<string>(text, {
@@ -552,8 +643,25 @@ Upload a TXT — replace the cover letter manually`
 
         ctx.session.jd = jd
         ctx.session.step = 'processing'
-        await ctx.reply('Processing your application... ⏳ (15–30s)')
+        await ctx.reply('Analysing fit... ⏳')
 
+        try {
+          await processApplication(ctx)
+        } catch (err) {
+          clearFlow(ctx)
+          const msg = err instanceof Error ? err.message : String(err)
+          await ctx.reply(`Failed:\n${msg}\n\nUse /apply to try again.`)
+        }
+        return
+      }
+
+      if (ctx.session.step === 'awaiting_context') {
+        if (text.toLowerCase() !== 'skip') {
+          ctx.session.additionalContext = text
+        }
+        ctx.session.contextGathered = true
+        ctx.session.step = 'processing'
+        await ctx.reply('Building your application... ⏳ (15–30s)')
         try {
           await processApplication(ctx)
         } catch (err) {
@@ -622,11 +730,15 @@ Upload a TXT — replace the cover letter manually`
         }
 
         const { target, note } = parseRevision(text)
-        const targetLabel = target === 'resume' ? 'resume' : target === 'cover-letter' ? 'cover letter' : 'both'
+        // If the user uploaded a manual DOCX, unqualified text should only revise
+        // the cover letter — not re-run the optimizer and lose their upload.
+        const effectiveTarget: RevisionTarget =
+          target === 'both' && ctx.session.resumeManuallyUploaded ? 'cover-letter' : target
+        const targetLabel = effectiveTarget === 'resume' ? 'resume' : effectiveTarget === 'cover-letter' ? 'cover letter' : 'both'
         await ctx.reply(`Revising ${targetLabel}... ⏳`)
         try {
           const cfg = getUserConfig()
-          await runAIAndSendPreview(ctx, cfg.portfolioUrl, note, target)
+          await runAIAndSendPreview(ctx, cfg.portfolioUrl, note, effectiveTarget)
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
           return ctx.reply(`Revision failed:\n${msg}`)
@@ -653,12 +765,27 @@ Upload a TXT — replace the cover letter manually`
       await ctx.reply('Downloading resume...')
       const file = await ctx.getFile()
       const fileUrl = `https://api.telegram.org/file/bot${config.telegramToken}/${file.file_path}`
-      const response = await axios.get<ArrayBuffer>(fileUrl, { responseType: 'arraybuffer' })
+      let buf: Buffer
+      try {
+        buf = await downloadWithRetry(fileUrl)
+      } catch {
+        return ctx.reply('Download failed (network error). Please try sending the file again.')
+      }
       const savePath = path.join(config.uploadsDir, `resume_upload_${Date.now()}${ext}`)
-      writeFileSync(savePath, Buffer.from(response.data))
+      writeFileSync(savePath, buf)
 
       ctx.session.pendingSetupPath = savePath
       ctx.session.step = 'awaiting_variant_label'
+
+      // Extract and persist cert links from this DOCX so they survive across all future applications
+      if (ext === '.docx') {
+        const links = await extractLinks(savePath)
+        if (Object.keys(links).length > 0) {
+          const existing = getUserConfig().certLinks ?? {}
+          setUserConfig({ certLinks: { ...existing, ...links } })
+          console.log('[setup] cert links saved:', Object.keys(links))
+        }
+      }
 
       const cfg = getUserConfig()
       const variants = cfg.variants ?? []
@@ -683,16 +810,22 @@ Upload a TXT — replace the cover letter manually`
 
       const file = await ctx.getFile()
       const fileUrl = `https://api.telegram.org/file/bot${config.telegramToken}/${file.file_path}`
-      const response = await axios.get<ArrayBuffer>(fileUrl, { responseType: 'arraybuffer' })
+      let buf: Buffer
+      try {
+        buf = await downloadWithRetry(fileUrl)
+      } catch {
+        return ctx.reply('Download failed (network error). Please try sending the file again.')
+      }
       const slug = toKebabCase(config.fromName)
-      const buf = Buffer.from(response.data)
 
       if (ext === '.docx') {
         const savePath = path.join(config.uploadsDir, `${slug}-edited.docx`)
         writeFileSync(savePath, buf)
         ctx.session.pendingResumePath = savePath
+        ctx.session.resumeManuallyUploaded = true
         return ctx.reply(
-          'Resume replaced with your edited version ✓\n\nReply *YES* to send or keep making changes.',
+          'Resume replaced with your edited version ✓\n\n' +
+          'Reply *YES* to send, upload a TXT to replace the cover letter, or type a note to revise the cover letter.',
           { parse_mode: 'Markdown' }
         )
       }

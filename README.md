@@ -5,11 +5,15 @@ An AI-powered Telegram bot that automates job applications. Paste a job URL or d
 ## Features
 
 - **Job URL scraping** — paste a job posting URL; role, company, and job description are extracted automatically
-- **AI resume optimization** — your resume is rewritten per-job for ATS keyword alignment
-- **AI cover letter** — professional, human-sounding cover letter scoped to the specific role
+- **AI resume optimization** — resume rewritten per-job for ATS keyword alignment; categorized skills section; 2-3 most relevant experience entries only
+- **AI cover letter** — human-sounding cover letter; banned AI phrases enforced; portfolio URL included inline
+- **Gap analysis** — flags hard technical skills explicitly required by the JD that are missing from your resume; soft skills and generic requirements are ignored
+- **No JD mode** — type "none" when asked for the job description; the bot crafts the application from the role title and your experience without guessing company details
 - **Multi-resume variants** — store separate base resumes (frontend, backend, fullstack, etc.) and pick per application
+- **Cert link persistence** — hyperlinks extracted from your DOCX at setup time and automatically applied to certificates in every generated resume
+- **Page overflow detection** — uses LibreOffice if available, falls back to a layout heuristic; retries with shorter bullets if the resume spills onto page 2
+- **Revision loop** — refine the resume or cover letter through natural language before sending; uploading an edited DOCX or TXT replaces just that document
 - **Follow-up scheduler** — get notified 7 days after applying; send a polished follow-up with one command
-- **Revision loop** — refine the resume or cover letter through natural language before sending
 - **AI provider cascade** — Gemini → DeepSeek → Claude (cheap-first, automatic fallback)
 - **Web dashboard** — track all applications, update status (interviewing / offer / rejected)
 - **Runs locally** — Docker Compose, no cloud accounts required; fully open source
@@ -67,6 +71,7 @@ Run `/apply`, paste a job URL or type the role name, and let the bot do the rest
 | Command | Description |
 |---|---|
 | `/setup` | Upload a resume variant and set your portfolio URL |
+| `/portfolio` | View, update, or clear your portfolio URL without re-running setup |
 | `/apply` | Start a new application |
 | `/status` | View your last 10 applications with status |
 | `/followup <id>` | Send a follow-up email for application #id |
@@ -85,6 +90,8 @@ Run `/apply`, paste a job URL or type the role name, and let the bot do the rest
 | `use 1`, `use 2` … | Swap in a previously generated resume |
 | Upload a `.docx` | Replace the resume with your edited file |
 | Upload a `.txt` | Replace the cover letter with your edited file |
+
+After uploading a DOCX, further free-text revisions will only touch the cover letter — the bot won't re-run the optimizer and lose your edits.
 
 ---
 
@@ -114,6 +121,20 @@ Bot: Found — Senior Frontend Engineer at Stripe | Preview: ...
 ```
 
 If the application email isn't found in the posting, you will be asked for it separately.
+
+---
+
+## No Job Description
+
+If you don't have a job description — or the role has none — type `none`, `n/a`, or `skip` when asked:
+
+```
+Bot: Paste the job description (or a URL), or type "none" to skip
+You: none
+Bot: Got it — will craft the application from the role and your experience.
+```
+
+The bot writes the cover letter and optimizes the resume based on the target role title and your actual experience. It will not guess what the company does from its name or email domain.
 
 ---
 
