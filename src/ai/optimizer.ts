@@ -1,6 +1,7 @@
 import { generate } from './providers'
+import type { ResumeAnalysis } from './resume-analyzer'
 
-const SYSTEM = `You are an expert ATS resume optimizer who writes like a real person, not a language model.
+const SYSTEM = `You are an expert ATS resume optimizer and ghostwriter who writes like a real person, not a language model.
 
 Content rules:
 - Mirror keywords from the job description naturally — never stuff them
@@ -10,12 +11,18 @@ Content rules:
 - Sort experience entries from most recent to oldest (highest start year first)
 - Include ONLY the 2-3 experience entries most directly relevant to the target role; omit entries from unrelated industries or domains
 - Give EXACTLY 5 bullets to the single experience entry that most closely matches the job description; give all other included entries EXACTLY 4 bullets
-- Each bullet must be 15-20 words: strong past-tense action verb → what you built/did and how → quantified result (number, %, or clear business impact)
-- When additional context fills a skills gap, rewrite or replace weaker bullets to incorporate it naturally; never exceed the bullet limit for that entry
 - Bullet text must NOT start with "- ", "• ", "* " or any marker — the renderer adds its own bullet character
 
+Bullet formula — use Google XYZ for every bullet:
+"Accomplished [X] as measured by [Y], by doing [Z]"
+- X = the result or outcome (what changed)
+- Y = the metric proving it (number, %, time, scale)
+- Z = the specific method, tool, or action that caused it
+- Example: "Reduced checkout latency by 60% (from 1.4s to 560ms), by replacing synchronous API calls with a batched GraphQL query"
+- If a metric isn't available, make Z specific enough to stand alone — never write a bullet without either Y or Z
+- 15-20 words per bullet; vary the opening verb across bullets
+
 Human tone — follow these strictly:
-- Vary the opening verb across bullets: don't start multiple bullets with the same word
 - Use specific, concrete language: "reduced load time from 3s to 400ms" not "improved performance"
 - Write how a confident engineer would describe their own work to a peer
 
@@ -68,13 +75,25 @@ export async function optimizeResume(
   role: string,
   portfolioUrl?: string,
   revisionNote?: string,
-  additionalContext?: string
+  additionalContext?: string,
+  analysis?: ResumeAnalysis,
 ): Promise<OptimizeResult> {
   const hasJd = jobDescription.trim().length > 0
 
   const jdSection = hasJd
     ? `Job description:\n<jd>\n${jobDescription}\n</jd>`
     : `No job description was provided. Optimize purely based on the target role title and the candidate's own experience. Do NOT guess or infer what the company does.`
+
+  const analysisSection = analysis ? `
+Pre-analysis from recruiter + ATS review (treat these as hard requirements for the rewrite):
+- Current match score: ${analysis.matchScore}/100 — the rewrite must address every gap below
+- Missing keywords — incorporate all of these naturally into bullets, summary, or skills:
+  ${analysis.missingKeywords.map(k => `• ${k}`).join('\n  ')}
+- Red flags to eliminate — fix each one explicitly:
+  ${analysis.redFlags.map(f => `• ${f}`).join('\n  ')}
+- Sections a skimming hiring manager would skip — rewrite each one to stop the scroll:
+  ${analysis.weakSections.map(s => `• ${s}`).join('\n  ')}
+` : ''
 
   const prompt = `Resume:
 <resume>
@@ -85,6 +104,7 @@ Target role: ${role}
 ${portfolioUrl ? `Portfolio: ${portfolioUrl}` : ''}
 ${additionalContext ? `\nAdditional experience/context provided by the applicant — incorporate naturally into bullets and summary:\n${additionalContext}\n` : ''}
 ${revisionNote ? `\nApplicant revision instructions (apply these on top of ATS optimisation):\n${revisionNote}\n` : ''}
+${analysisSection}
 ${jdSection}
 
 Return this exact JSON shape:

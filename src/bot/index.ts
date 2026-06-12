@@ -15,6 +15,7 @@ import { generateCoverLetter } from '../ai/cover-letter'
 import { extractJobDetails } from '../ai/job-extractor'
 import { generateFollowUp } from '../ai/follow-up'
 import { analyzeGaps } from '../ai/gap-analyzer'
+import { analyzeResumeVsJd, formatAnalysisCard, type ResumeAnalysis } from '../ai/resume-analyzer'
 import { generateResumeDocx } from '../resume/generator'
 import { extractLinks } from '../resume/parser'
 import { countDocxPages } from '../resume/page-check'
@@ -62,6 +63,7 @@ interface SessionData {
   selectedVariant?: string    // label of chosen resume variant
   additionalContext?: string  // extra info provided after gap analysis
   contextGathered?: boolean   // true once gap analysis step is complete
+  lastAnalysis?: ResumeAnalysis  // recruiter/ATS analysis from first pass; fed into optimizer
   pendingResumePath?: string
   resumeManuallyUploaded?: boolean  // true when user uploaded a DOCX; prevents free-text from re-running optimizer
   pendingCoverLetter?: string
@@ -181,9 +183,22 @@ async function runAIAndSendPreview(
   let providerCL = ''
   let keywords: string[] = []
 
+  // Run recruiter + ATS analysis on the first pass only (has JD, not a revision)
+  const isFirstPass = !revisionNote && !!jd?.trim()
+  if (shouldReviseResume && isFirstPass) {
+    try {
+      const { analysis } = await analyzeResumeVsJd(resumeText!, jd!, role!)
+      await ctx.reply(formatAnalysisCard(analysis), { parse_mode: 'Markdown' })
+      ctx.session.lastAnalysis = analysis
+    } catch (err) {
+      console.warn('[analyzer] failed, continuing without analysis:', (err as Error).message)
+    }
+  }
+
   if (shouldReviseResume) {
     const certLinks = getUserConfig().certLinks
-    const optimized = await optimizeResume(resumeText!, jd!, role!, portfolioUrl, revisionNote, ctx.session.additionalContext)
+    const analysis = isFirstPass ? ctx.session.lastAnalysis : undefined
+    const optimized = await optimizeResume(resumeText!, jd!, role!, portfolioUrl, revisionNote, ctx.session.additionalContext, analysis)
     resumePath = await generateResumeDocx(optimized.resume, `${slug}-${ts}.docx`, certLinks)
     ctx.session.resumeManuallyUploaded = false  // AI owns the resume now
     providerResume = optimized.provider
@@ -195,7 +210,7 @@ async function runAIAndSendPreview(
       console.log('[resume] overflow detected — retrying with shorter bullets')
       const shortenNote = (revisionNote ? revisionNote + '\n\n' : '') +
         'CRITICAL: The resume is currently overflowing to a second page. Reduce every bullet point to at most 10 words. Keep only the single most impactful fact per bullet. Do not change anything else.'
-      const reopt = await optimizeResume(resumeText!, jd!, role!, portfolioUrl, shortenNote, ctx.session.additionalContext)
+      const reopt = await optimizeResume(resumeText!, jd!, role!, portfolioUrl, shortenNote, ctx.session.additionalContext, analysis)
       resumePath = await generateResumeDocx(reopt.resume, `${slug}-${ts}.docx`, certLinks)
       providerResume = reopt.provider
       keywords = reopt.keywordsAdded ?? []
